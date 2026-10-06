@@ -16,6 +16,9 @@ class TimerManager;
 class Timer : public std::enable_shared_from_this<Timer> 
 {
     friend class TimerManager;
+#ifdef SYLAR_TIMER_TESTING
+    friend class TimerTestAccess;
+#endif
 public:
     // 从时间堆中删除timer
     bool cancel();
@@ -34,6 +37,8 @@ private:
     uint64_t m_ms = 0;
     // 绝对超时时间
     std::chrono::time_point<std::chrono::system_clock> m_next;
+    // 区分相同截止时间的不同 timer，避免 std::set 将其视为等价元素。
+    uint64_t m_id = 0;
     // 超时时触发的回调函数
     std::function<void()> m_cb;
     // 管理此timer的管理器

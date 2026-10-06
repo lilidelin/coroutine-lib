@@ -1,58 +1,76 @@
-// ============================================================
-// Bench 1: Sleep 吞吐量（公平对比）
-//
-// 【控制变量】工作线程数固定 = NUM_WORKERS，任务数固定 NUM_TASKS
-// 【唯一变量】是否用 hook 协程包装阻塞 sleep
-//
-// A 组（blocking）：线程池里的线程调真正的阻塞 sleep
-//     线程卡在 sleep 期间不能干别的 → 4 线程 × 1ms sleep ≈ 4000 tasks/sec
-// B 组（coroutine + hook）：调被 hook 的 sleep
-//     协程挂起，线程马上去跑下一个协程 → 总耗时接近 1ms
-// ============================================================
+// 等待任务吞吐量对比。两组均使用相同数量的实际工作线程。
+// 该测试展示等待期间是否占用工作线程，不代表真实网络服务的端到端吞吐量。
 
-#include "ioscheduler.h"
 #include "hook.h"
+#include "ioscheduler.h"
 
-#include <iostream>
-#include <chrono>
 #include <atomic>
-#include <deque>
-#include <mutex>
+#include <chrono>
 #include <condition_variable>
-#include <thread>
+#include <deque>
 #include <functional>
+#include <iostream>
+#include <mutex>
+#include <thread>
 #include <vector>
 
-static const int NUM_WORKERS = 4;
-static const int NUM_TASKS   = 10000;
-static const int TASK_SLEEP_US = 1000; // 每个任务 sleep 1ms
+namespace {
 
-static std::atomic<int> g_done{0};
-static std::chrono::high_resolution_clock::time_point g_t0;
+constexpr int kWorkerCount = 4;
+constexpr int kTaskCount = 10000;
+constexpr int kSleepUs = 1000;
+constexpr auto kTimeout = std::chrono::seconds(30);
 
-// ============================================================
-// A 组：线程池 + 真阻塞
-// ============================================================
-struct ThreadPool {
-    std::deque<std::function<void()>> q;
-    std::mutex mtx;
-    std::condition_variable cv;
-    bool stopped = false;
-    std::vector<std::thread> workers;
+class Completion {
+public:
+    void complete()
+    {
+        if (m_remaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_cv.notify_one();
+        }
+    }
 
-    explicit ThreadPool(int n) {
-        for (int i = 0; i < n; ++i) {
-            workers.emplace_back([this](){
-                // ★ 关键：关掉 hook，用真正的阻塞 sleep！
+    bool waitForAll()
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_cv.wait_for(lock, kTimeout, [this] {
+            return m_remaining.load(std::memory_order_acquire) == 0;
+        });
+    }
+
+    int completed() const
+    {
+        return kTaskCount - m_remaining.load(std::memory_order_acquire);
+    }
+
+private:
+    std::atomic<int> m_remaining{kTaskCount};
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+};
+
+class ThreadPool {
+public:
+    explicit ThreadPool(int count)
+    {
+        for (int i = 0; i < count; ++i)
+        {
+            m_workers.emplace_back([this] {
                 sylar::set_hook_enable(false);
-                while (true) {
+                while (true)
+                {
                     std::function<void()> task;
                     {
-                        std::unique_lock<std::mutex> lk(mtx);
-                        cv.wait(lk, [this]{ return stopped || !q.empty(); });
-                        if (stopped && q.empty()) return;
-                        task = std::move(q.front());
-                        q.pop_front();
+                        std::unique_lock<std::mutex> lock(m_mutex);
+                        m_cv.wait(lock, [this] { return m_stopping || !m_tasks.empty(); });
+                        if (m_stopping && m_tasks.empty())
+                        {
+                            return;
+                        }
+                        task = std::move(m_tasks.front());
+                        m_tasks.pop_front();
                     }
                     task();
                 }
@@ -60,105 +78,101 @@ struct ThreadPool {
         }
     }
 
-    void submit(std::function<void()> f) {
+    ~ThreadPool()
+    {
         {
-            std::lock_guard<std::mutex> lk(mtx);
-            q.push_back(std::move(f));
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stopping = true;
         }
-        cv.notify_one();
+        m_cv.notify_all();
+        for (auto& worker : m_workers)
+        {
+            worker.join();
+        }
     }
 
-    ~ThreadPool() {
+    void submit(std::function<void()> task)
+    {
         {
-            std::lock_guard<std::mutex> lk(mtx);
-            stopped = true;
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_tasks.push_back(std::move(task));
         }
-        cv.notify_all();
-        for (auto &t : workers) if (t.joinable()) t.join();
+        m_cv.notify_one();
     }
+
+private:
+    std::deque<std::function<void()>> m_tasks;
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+    bool m_stopping = false;
+    std::vector<std::thread> m_workers;
 };
 
-static void blocking_sleep_task() {
-    // ★ 用真正的系统阻塞 sleep（std::this_thread，不走 hook）
-    std::this_thread::sleep_for(std::chrono::microseconds(TASK_SLEEP_US));
-    int done = g_done.fetch_add(1) + 1;
-    if (done == NUM_TASKS) {
-        auto t1 = std::chrono::high_resolution_clock::now();
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - g_t0).count();
-        std::cout << "[POOL+BLOCK] threads=" << NUM_WORKERS
-                  << " tasks=" << NUM_TASKS
-                  << " each=" << (TASK_SLEEP_US/1000) << "ms"
-                  << "  =>  total=" << ms << "ms"
-                  << "  QPS≈" << (long long)NUM_TASKS * 1000 / (ms ? ms : 1)
-                  << std::endl;
-        long long theory = (long long)NUM_WORKERS * 1000000 / TASK_SLEEP_US;
-        std::cout << "  (理论阻塞型上限: " << theory << " tasks/sec)\n";
-    }
+void printResult(const char* label, bool finished, int completed,
+                 std::chrono::milliseconds elapsed)
+{
+    const auto milliseconds = elapsed.count();
+    const auto throughput = milliseconds > 0
+        ? static_cast<long long>(completed) * 1000 / milliseconds
+        : 0;
+    std::cout << '[' << label << "] workers=" << kWorkerCount
+              << " submitted=" << kTaskCount
+              << " completed=" << completed
+              << " failed=" << (kTaskCount - completed)
+              << " timed_out=" << (finished ? 0 : 1)
+              << " wall_time_ms=" << milliseconds
+              << " throughput_tasks_per_sec=" << throughput << '\n';
 }
 
-static void bench_thread_pool_blocking() {
-    g_done = 0;
-    std::cout << "\n===== A. Thread Pool + Blocking IO =====" << std::endl;
-    std::cout << "workers=" << NUM_WORKERS
-              << " (sleep 期间线程被阻塞，无法处理其他任务)\n";
-    ThreadPool pool(NUM_WORKERS);
-    g_t0 = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < NUM_TASKS; ++i) {
-        pool.submit(blocking_sleep_task);
+bool benchThreadPoolBlocking()
+{
+    Completion completion;
+    ThreadPool pool(kWorkerCount);
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < kTaskCount; ++i)
+    {
+        pool.submit([&completion] {
+            std::this_thread::sleep_for(std::chrono::microseconds(kSleepUs));
+            completion.complete();
+        });
     }
-    while (g_done.load() < NUM_TASKS) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+
+    const bool finished = completion.waitForAll();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    printResult("POOL+BLOCK", finished, completion.completed(), elapsed);
+    return finished;
 }
 
-// ============================================================
-// B 组：协程 + hook（同线程数）
-// ============================================================
-static void coro_sleep_task() {
-    // ★ 用被 hook 的 sleep：协程挂起，线程去跑其他协程
-    usleep(TASK_SLEEP_US);
-    int done = g_done.fetch_add(1) + 1;
-    if (done == NUM_TASKS) {
-        auto t1 = std::chrono::high_resolution_clock::now();
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - g_t0).count();
-        std::cout << "[CORO+HOOK  ] threads=" << NUM_WORKERS
-                  << " tasks=" << NUM_TASKS
-                  << " each=" << (TASK_SLEEP_US/1000) << "ms"
-                  << "  =>  total=" << ms << "ms"
-                  << "  QPS≈" << (long long)NUM_TASKS * 1000 / (ms ? ms : 1)
-                  << std::endl;
+bool benchCoroutineHook()
+{
+    Completion completion;
+    // use_caller=false: 只有 kWorkerCount 个工作线程参与调度。
+    sylar::IOManager iom(kWorkerCount, false, "bench-coro");
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < kTaskCount; ++i)
+    {
+        iom.scheduleLock(std::function<void()>([&completion] {
+            usleep(kSleepUs);
+            completion.complete();
+        }));
     }
+
+    const bool finished = completion.waitForAll();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    printResult("CORO+HOOK", finished, completion.completed(), elapsed);
+    // use_caller=false 的 IOManager 需由非创建者线程执行 stop()；该线程不调度任务。
+    std::thread stopper([&iom] { iom.stop(); });
+    stopper.join();
+    return finished;
 }
 
-static void bench_coro_hook() {
-    g_done = 0;
-    std::cout << "\n===== B. Coroutine + Hook IO =====" << std::endl;
-    std::cout << "workers=" << NUM_WORKERS
-              << " (sleep 期间线程不阻塞，可腾挪跑其他协程)\n";
+} // namespace
 
-    sylar::IOManager iom(NUM_WORKERS + 1, true, "bench-coro");
-    g_t0 = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < NUM_TASKS; ++i) {
-        iom.scheduleLock(std::function<void()>(coro_sleep_task));
-    }
-    // 用监控线程等完成后退出
-    std::thread([](){
-        while (g_done.load() < NUM_TASKS) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-        std::cout << "\n===== All done. Ctrl+C to exit (iom cleanup). =====" << std::endl;
-        std::exit(0);
-    }).detach();
-}
-
-int main() {
-    std::cout << "================================================\n";
-    std::cout << "  Bench1 吞吐量公平对比：" << NUM_WORKERS
-              << " 线程 + " << NUM_TASKS << " 个慢 IO 任务\n";
-    std::cout << "  唯一变量：是否用 hook 协程把阻塞 sleep 转成协程挂起\n";
-    std::cout << "================================================\n";
-
-    bench_thread_pool_blocking();
-    bench_coro_hook();
-    return 0;
+int main()
+{
+    std::cout << "waiting-task benchmark: " << kWorkerCount << " workers, "
+              << kTaskCount << " tasks, " << kSleepUs << "us wait each\n";
+    return benchThreadPoolBlocking() && benchCoroutineHook() ? 0 : 1;
 }

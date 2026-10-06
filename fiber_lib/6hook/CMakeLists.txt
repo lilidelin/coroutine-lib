@@ -66,6 +66,11 @@ target_link_libraries(sylar_hook_lib PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 add_executable(main_hook_demo main.cpp)
 target_link_libraries(main_hook_demo PRIVATE sylar_hook_lib)
 
+# 最小回归用例：同一截止时间的多个 timer 都应保留并触发。
+add_executable(timer_same_deadline_test tests/timer_same_deadline_test.cpp)
+target_link_libraries(timer_same_deadline_test PRIVATE sylar_hook_lib)
+target_compile_definitions(timer_same_deadline_test PRIVATE SYLAR_TIMER_TESTING)
+
 # ---- benchmark 子目录 ----
 option(BUILD_6HOOK_BENCHMARKS "Build benchmarks for 6hook module" ON)
 if(BUILD_6HOOK_BENCHMARKS)

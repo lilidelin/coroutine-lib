@@ -1,6 +1,10 @@
 #include "timer.h"
 
+#include <atomic>
+
 namespace sylar {
+
+static std::atomic<uint64_t> s_timer_id{0};
 
 bool Timer::cancel() 
 {
@@ -79,6 +83,7 @@ bool Timer::reset(uint64_t ms, bool from_now)
 Timer::Timer(uint64_t ms, std::function<void()> cb, bool recurring, TimerManager* manager):
 m_recurring(recurring), m_ms(ms), m_cb(cb), m_manager(manager) 
 {
+    m_id = s_timer_id.fetch_add(1, std::memory_order_relaxed);
     auto now = std::chrono::system_clock::now();
     m_next = now + std::chrono::milliseconds(m_ms);
 }
@@ -86,7 +91,11 @@ m_recurring(recurring), m_ms(ms), m_cb(cb), m_manager(manager)
 bool Timer::Comparator::operator()(const std::shared_ptr<Timer>& lhs, const std::shared_ptr<Timer>& rhs) const
 {
     assert(lhs!=nullptr&&rhs!=nullptr);
-    return lhs->m_next < rhs->m_next;
+    if (lhs->m_next != rhs->m_next)
+    {
+        return lhs->m_next < rhs->m_next;
+    }
+    return lhs->m_id < rhs->m_id;
 }
 
 TimerManager::TimerManager() 
@@ -220,4 +229,3 @@ bool TimerManager::detectClockRollover()
 }
 
 }
-
